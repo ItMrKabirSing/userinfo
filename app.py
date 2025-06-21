@@ -1,4 +1,4 @@
-from quart import Quart, request, jsonify
+from flask import Flask, request, jsonify
 from pyrogram import Client
 from pyrogram.errors import PeerIdInvalid, UsernameNotOccupied, ChannelInvalid
 from pyrogram.enums import ChatType
@@ -8,14 +8,47 @@ from config import API_ID, API_HASH, BOT_TOKEN
 import logging
 import os
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import functools
 
-app = Quart(__name__)
+app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global client instance
+# Global variables
 bot = None
+loop = None
+executor = ThreadPoolExecutor(max_workers=4)
+
+def run_async_in_thread(coro):
+    """Run async function in a separate thread with its own event loop"""
+    def run_in_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    
+    future = executor.submit(run_in_loop)
+    return future.result()
+
+def async_route(f):
+    """Decorator to handle async functions in Flask routes"""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            coro = f(*args, **kwargs)
+            return run_async_in_thread(coro)
+        except Exception as e:
+            logger.error(f"Error in async route: {str(e)}")
+            return jsonify({
+                "success": False,
+                "error": "Internal server error"
+            }), 500
+    return wrapper
 
 async def get_bot_client():
     """Get or create bot client instance"""
@@ -29,6 +62,7 @@ async def get_bot_client():
             workdir="/tmp"
         )
         await bot.start()
+        logger.info("Bot client started successfully")
     return bot
 
 def get_dc_locations():
@@ -106,7 +140,7 @@ def clean_username(username):
     return username
 
 @app.route('/')
-async def welcome():
+def welcome():
     """Welcome endpoint with API documentation"""
     return jsonify({
         "message": "Welcome to the SmartDevs Info API!",
@@ -127,6 +161,7 @@ async def welcome():
     })
 
 @app.route('/info')
+@async_route
 async def get_info():
     """Main endpoint to get Telegram entity information"""
     username = request.args.get('username')
@@ -258,6 +293,7 @@ async def get_info():
         }), 500
 
 @app.route('/health')
+@async_route
 async def health_check():
     """Health check endpoint"""
     try:
@@ -274,28 +310,8 @@ async def health_check():
             "timestamp": datetime.now().isoformat()
         }), 500
 
-@app.before_serving
-async def startup():
-    """Initialize bot client on startup"""
-    try:
-        await get_bot_client()
-        logger.info("Bot client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize bot client: {e}")
-
-@app.after_serving
-async def shutdown():
-    """Clean up on shutdown"""
-    global bot
-    if bot and bot.is_connected:
-        try:
-            await bot.stop()
-            logger.info("Bot client stopped successfully")
-        except Exception as e:
-            logger.error(f"Error stopping bot client: {e}")
-
 @app.errorhandler(404)
-async def not_found(error):
+def not_found(error):
     """Handle 404 errors"""
     return jsonify({
         "success": False,
@@ -303,12 +319,25 @@ async def not_found(error):
     }), 404
 
 @app.errorhandler(500)
-async def internal_error(error):
+def internal_error(error):
     """Handle 500 errors"""
     return jsonify({
         "success": False,
         "error": "Internal server error"
     }), 500
+
+# Initialize bot on startup
+def init_bot():
+    """Initialize bot in a separate thread"""
+    try:
+        run_async_in_thread(get_bot_client())
+        logger.info("Bot initialization completed")
+    except Exception as e:
+        logger.error(f"Failed to initialize bot: {e}")
+
+# Start bot initialization in background
+init_thread = threading.Thread(target=init_bot, daemon=True)
+init_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
