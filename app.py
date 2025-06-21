@@ -8,6 +8,7 @@ from config import API_ID, API_HASH, BOT_TOKEN
 import logging
 import os
 import asyncio
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -28,6 +29,9 @@ bot = Client(
     workdir="/tmp"
 )
 
+# Global event loop for Pyrogram
+loop = asyncio.get_event_loop()
+
 # Start bot asynchronously
 async def start_bot():
     try:
@@ -38,12 +42,18 @@ async def start_bot():
         raise
 
 # Initialize bot before Flask starts
-loop = asyncio.get_event_loop()
 try:
     loop.run_until_complete(start_bot())
 except Exception as e:
     logger.error(f"Bot initialization failed: {str(e)}")
     exit(1)
+
+# Decorator to run async functions in Flask routes
+def async_action(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        return asyncio.run_coroutine_threadsafe(f(*args, **kwargs), loop).result()
+    return decorated
 
 def get_dc_locations():
     return {
@@ -122,7 +132,8 @@ def welcome():
     })
 
 @app.route('/info')
-def get_info():
+@async_action
+async def get_info():
     username = request.args.get('username')
     if not username:
         return jsonify({"error": "Username parameter is required"}), 400
@@ -134,7 +145,7 @@ def get_info():
         DC_LOCATIONS = get_dc_locations()
 
         try:
-            user = bot.get_users(username)
+            user = await bot.get_users(username)
             logger.info(f"User/bot found: {username}")
             premium_status = "Yes" if user.is_premium else "No"
             dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
@@ -163,7 +174,7 @@ def get_info():
         except (PeerIdInvalid, UsernameNotOccupied):
             logger.info(f"Username '{username}' not found as user/bot. Checking for chat...")
             try:
-                chat = bot.get_chat(username)
+                chat = await bot.get_chat(username)
                 dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
                 chat_type = {
                     ChatType.SUPERGROUP: "Supergroup",
@@ -202,4 +213,9 @@ def get_info():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # Default to 10000 for Render
     logger.info(f"Starting Flask app on host 0.0.0.0, port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Use hypercorn for async support
+    from hypercorn.config import Config
+    from hypercorn.asyncio import serve
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+    loop.run_until_complete(serve(app, config))
