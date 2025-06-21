@@ -1,4 +1,4 @@
-quart
+flask
 pyrofork
 tgcrypto
 python-dateutil
