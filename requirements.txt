@@ -1,5 +1,5 @@
-flask
-pyrofork==2.3.66
+quart
+pyrofork
 tgcrypto
-python-dateutil==2.9.0
-gunicorn==23.0.0
+python-dateutil
+gunicorn
