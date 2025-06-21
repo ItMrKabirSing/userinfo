@@ -135,7 +135,6 @@ async def get_info(username: str = Query(None)):
         DC_LOCATIONS = get_dc_locations()
 
         try:
-            # Add timeout for Pyrogram calls
             user = await asyncio.wait_for(bot.get_users(username), timeout=10.0)
             logger.info(f"User/bot found: {username}")
             premium_status = "Yes" if user.is_premium else "No"
