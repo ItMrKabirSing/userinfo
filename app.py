@@ -204,8 +204,3 @@ async def get_info():
     except Exception as e:
         logger.error(f"Unhandled exception for '{username}': {str(e)}")
         return jsonify({"error": "Internal Server Error"}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Default to 10000 for Render
-    logger.info(f"Starting Quart app on host 0.0.0.0, port {port}")
-    app.run(host="0.0.0.0", port=port, loop=loop)
