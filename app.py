@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from flask import Flask, request, jsonify
 from pyrogram import Client
 from pyrogram.errors import PeerIdInvalid, UsernameNotOccupied, ChannelInvalid
 from pyrogram.enums import ChatType
@@ -8,18 +8,12 @@ from config import API_ID, API_HASH, BOT_TOKEN
 import logging
 import os
 import asyncio
-import uvicorn
 
-app = FastAPI()
+app = Flask(__name__)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Pyrogram client setup
 session_path = os.path.join('/tmp', 'info_bot.session')
 bot = Client(
     name="info_bot",
@@ -29,23 +23,7 @@ bot = Client(
     workdir="/tmp"
 )
 
-# Start bot asynchronously
-async def start_bot():
-    try:
-        await bot.start()
-        logger.info("Pyrogram bot started successfully")
-    except Exception as e:
-        logger.error(f"Failed to start Pyrogram bot: {str(e)}")
-        raise
-
-# Initialize bot at startup
-@app.on_event("startup")
-async def startup_event():
-    try:
-        await start_bot()
-    except Exception as e:
-        logger.error(f"Bot initialization failed: {str(e)}")
-        raise
+bot.start()
 
 def get_dc_locations():
     return {
@@ -104,9 +82,9 @@ def map_user_status(status):
         return "Last seen within month"
     return "Unknown"
 
-@app.get("/")
-async def welcome():
-    return {
+@app.route('/')
+def welcome():
+    return jsonify({
         "message": "Welcome to the SmartDevs Info API!",
         "usage": {
             "endpoint": "/info",
@@ -121,12 +99,13 @@ async def welcome():
             "response": "JSON object containing entity details (user/bot/channel/group info, account age, data center, etc.)"
         },
         "note": "Ensure valid Telegram credentials are set in config.py."
-    }
+    })
 
-@app.get("/info")
-async def get_info(username: str = Query(None)):
+@app.route('/info')
+def get_info():
+    username = request.args.get('username')
     if not username:
-        raise HTTPException(status_code=400, detail="Username parameter is required")
+        return jsonify({"error": "Username parameter is required"}), 400
 
     username = username.strip('@').replace('https://', '').replace('http://', '').replace('t.me/', '').replace('/', '').replace(':', '')
     logger.info(f"Fetching info for: {username}")
@@ -135,7 +114,7 @@ async def get_info(username: str = Query(None)):
         DC_LOCATIONS = get_dc_locations()
 
         try:
-            user = await asyncio.wait_for(bot.get_users(username), timeout=10.0)
+            user = bot.get_users(username)
             logger.info(f"User/bot found: {username}")
             premium_status = "Yes" if user.is_premium else "No"
             dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
@@ -146,7 +125,7 @@ async def get_info(username: str = Query(None)):
             status = map_user_status(user.status)
             flags = "Scam" if getattr(user, 'is_scam', False) else "Fake" if getattr(user, 'is_fake', False) else "Clean"
 
-            return {
+            return jsonify({
                 "type": "bot" if user.is_bot else "user",
                 "full_name": f"{user.first_name} {user.last_name or ''}",
                 "id": user.id,
@@ -159,12 +138,12 @@ async def get_info(username: str = Query(None)):
                 "status": status,
                 "account_created_on": account_created_str,
                 "account_age": account_age
-            }
+            })
 
         except (PeerIdInvalid, UsernameNotOccupied):
             logger.info(f"Username '{username}' not found as user/bot. Checking for chat...")
             try:
-                chat = await asyncio.wait_for(bot.get_chat(username), timeout=10.0)
+                chat = bot.get_chat(username)
                 dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
                 chat_type = {
                     ChatType.SUPERGROUP: "Supergroup",
@@ -172,40 +151,33 @@ async def get_info(username: str = Query(None)):
                     ChatType.CHANNEL: "Channel"
                 }.get(chat.type, "Unknown")
 
-                return {
+                return jsonify({
                     "type": chat_type.lower(),
                     "title": chat.title,
                     "id": chat.id,
                     "type_description": chat_type,
                     "member_count": chat.members_count if chat.members_count else "Unknown",
                     "data_center": f"{chat.dc_id} ({dc_location})"
-                }
+                })
 
             except UsernameNotOccupied:
                 logger.error(f"Username '{username}' does not exist")
-                raise HTTPException(status_code=404, detail=f"Username '@{username}' does not exist")
+                return jsonify({"error": f"Username '@{username}' does not exist"}), 404
             except (ChannelInvalid, PeerIdInvalid):
+                error_message = "Bot lacks permission to access this channel or group"
                 logger.error(f"Permission error for '{username}'")
-                raise HTTPException(status_code=403, detail="Bot lacks permission to access this channel or group")
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout fetching chat info for '{username}'")
-                raise HTTPException(status_code=504, detail="Request to Telegram API timed out")
+                return jsonify({"error": error_message}), 403
             except Exception as e:
                 logger.error(f"Error fetching chat info for '{username}': {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Failed to fetch info: {str(e)}")
+                return jsonify({"error": f"Failed to fetch info: {str(e)}"}), 500
 
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching user info for '{username}'")
-            raise HTTPException(status_code=504, detail="Request to Telegram API timed out")
         except Exception as e:
             logger.error(f"Error fetching user info for '{username}': {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch info: {str(e)}")
+            return jsonify({"error": f"Failed to fetch info: {str(e)}"}), 500
 
     except Exception as e:
         logger.error(f"Unhandled exception for '{username}': {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        return jsonify({"error": "Internal Server Error"}), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting FastAPI app on host 0.0.0.0, port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
