@@ -1,5 +1,6 @@
-quart
+fastapi==0.115.0
 pyrofork==2.3.66
-tgcrypto==1.2.5
-python-dateutil==2.9.0.post0
+tgcrypto
+python-dateutil==2.9.0
+uvicorn==0.30.6
 gunicorn==23.0.0
