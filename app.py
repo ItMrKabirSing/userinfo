@@ -9,8 +9,7 @@ import logging
 import os
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
-import functools
+import time
 
 app = Flask(__name__)
 
@@ -19,53 +18,39 @@ logger = logging.getLogger(__name__)
 
 # Global variables
 bot = None
+bot_lock = threading.Lock()
 loop = None
-executor = ThreadPoolExecutor(max_workers=4)
+loop_thread = None
 
-def run_async_in_thread(coro):
-    """Run async function in a separate thread with its own event loop"""
-    def run_in_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-    
-    future = executor.submit(run_in_loop)
-    return future.result()
+def start_event_loop():
+    """Start a dedicated event loop in a separate thread"""
+    global loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-def async_route(f):
-    """Decorator to handle async functions in Flask routes"""
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        try:
-            # Extract request data in the main thread
-            request_args = request.args.to_dict() if request.args else {}
-            # Call the async function with extracted data
-            coro = f(request_args, *args, **kwargs)
-            return run_async_in_thread(coro)
-        except Exception as e:
-            logger.error(f"Error in async route: {str(e)}")
-            return jsonify({
-                "success": False,
-                "error": "Internal server error"
-            }), 500
-    return wrapper
+def run_async(coro):
+    """Run async function in the dedicated event loop"""
+    global loop
+    if loop is None:
+        return None
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=30)  # 30 second timeout
 
-async def get_bot_client():
-    """Get or create bot client instance"""
+async def init_bot():
+    """Initialize the bot client"""
     global bot
-    if bot is None:
-        bot = Client(
-            name="info_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            workdir="/tmp"
-        )
-        await bot.start()
-        logger.info("Bot client started successfully")
+    with bot_lock:
+        if bot is None:
+            bot = Client(
+                name="info_bot",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
+                workdir="/tmp"
+            )
+            await bot.start()
+            logger.info("Bot client started successfully")
     return bot
 
 def get_dc_locations():
@@ -142,6 +127,119 @@ def clean_username(username):
     
     return username
 
+async def fetch_user_info(username):
+    """Fetch user information from Telegram"""
+    global bot
+    
+    # Ensure bot is initialized
+    if bot is None:
+        await init_bot()
+    
+    DC_LOCATIONS = get_dc_locations()
+    
+    try:
+        user = await bot.get_users(username)
+        logger.info(f"User/bot found: {username}")
+        
+        # Extract user information
+        premium_status = "Yes" if getattr(user, 'is_premium', False) else "No"
+        dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
+        account_created = estimate_account_creation_date(user.id)
+        account_created_str = account_created.strftime("%B %d, %Y")
+        account_age = calculate_account_age(account_created)
+        verified_status = "Yes" if getattr(user, 'is_verified', False) else "No"
+        status = map_user_status(getattr(user, 'status', None))
+        
+        # Check flags
+        flags = []
+        if getattr(user, 'is_scam', False):
+            flags.append("Scam")
+        if getattr(user, 'is_fake', False):
+            flags.append("Fake")
+        flags_str = ", ".join(flags) if flags else "Clean"
+
+        # Build full name
+        full_name_parts = []
+        if user.first_name:
+            full_name_parts.append(user.first_name)
+        if user.last_name:
+            full_name_parts.append(user.last_name)
+        full_name = " ".join(full_name_parts) if full_name_parts else "Unknown"
+
+        return {
+            "success": True,
+            "type": "bot" if user.is_bot else "user",
+            "full_name": full_name,
+            "id": user.id,
+            "username": f"@{user.username}" if user.username else "None",
+            "context_id": user.id,
+            "data_center": f"{user.dc_id} ({dc_location})" if user.dc_id else "Unknown",
+            "premium": premium_status,
+            "verified": verified_status,
+            "flags": flags_str,
+            "status": status,
+            "account_created_on": account_created_str,
+            "account_age": account_age
+        }
+
+    except (PeerIdInvalid, UsernameNotOccupied):
+        logger.info(f"Username '{username}' not found as user/bot. Checking for chat...")
+        
+        try:
+            chat = await bot.get_chat(username)
+            logger.info(f"Chat found: {username}")
+            
+            dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
+            
+            # Map chat type
+            chat_type_map = {
+                ChatType.SUPERGROUP: "Supergroup",
+                ChatType.GROUP: "Group",
+                ChatType.CHANNEL: "Channel"
+            }
+            chat_type = chat_type_map.get(chat.type, "Unknown")
+
+            return {
+                "success": True,
+                "type": chat_type.lower(),
+                "title": chat.title or "Unknown",
+                "id": chat.id,
+                "type_description": chat_type,
+                "member_count": chat.members_count if hasattr(chat, 'members_count') and chat.members_count else "Unknown",
+                "data_center": f"{chat.dc_id} ({dc_location})" if chat.dc_id else "Unknown",
+                "username": f"@{chat.username}" if hasattr(chat, 'username') and chat.username else "None",
+                "description": chat.description if hasattr(chat, 'description') and chat.description else "None"
+            }
+
+        except UsernameNotOccupied:
+            logger.error(f"Username '{username}' does not exist")
+            return {
+                "success": False,
+                "error": f"Username '@{username}' does not exist"
+            }, 404
+            
+        except (ChannelInvalid, PeerIdInvalid):
+            error_message = "Bot lacks permission to access this channel or group"
+            logger.error(f"Permission error for '{username}': {error_message}")
+            return {
+                "success": False,
+                "error": error_message
+            }, 403
+            
+        except Exception as chat_error:
+            logger.error(f"Error fetching chat info for '{username}': {str(chat_error)}")
+            return {
+                "success": False,
+                "error": f"Failed to fetch chat info: {str(chat_error)}"
+            }, 500
+
+    except Exception as user_error:
+        logger.error(f"Error fetching user info for '{username}': {str(user_error)}")
+        return {
+            "success": False,
+            "error": f"Failed to fetch user info: {str(user_error)}"
+        }, 500
+
 @app.route('/')
 def welcome():
     """Welcome endpoint with API documentation"""
@@ -164,130 +262,28 @@ def welcome():
     })
 
 @app.route('/info')
-@async_route
-async def get_info(request_args):
+def get_info():
     """Main endpoint to get Telegram entity information"""
-    username = request_args.get('username')
+    username = request.args.get('username')
     if not username:
-        return jsonify({"error": "Username parameter is required"}), 400
+        return jsonify({"success": False, "error": "Username parameter is required"}), 400
 
     # Clean and validate username
     username = clean_username(username)
     if not username:
-        return jsonify({"error": "Invalid username format"}), 400
+        return jsonify({"success": False, "error": "Invalid username format"}), 400
 
     logger.info(f"Fetching info for: {username}")
 
     try:
-        # Get bot client
-        client = await get_bot_client()
-        DC_LOCATIONS = get_dc_locations()
-
-        # First try to get as user/bot
-        try:
-            user = await client.get_users(username)
-            logger.info(f"User/bot found: {username}")
+        # Run async function in the dedicated event loop
+        result = run_async(fetch_user_info(username))
+        
+        if isinstance(result, tuple):
+            return jsonify(result[0]), result[1]
+        else:
+            return jsonify(result)
             
-            # Extract user information
-            premium_status = "Yes" if getattr(user, 'is_premium', False) else "No"
-            dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
-            account_created = estimate_account_creation_date(user.id)
-            account_created_str = account_created.strftime("%B %d, %Y")
-            account_age = calculate_account_age(account_created)
-            verified_status = "Yes" if getattr(user, 'is_verified', False) else "No"
-            status = map_user_status(getattr(user, 'status', None))
-            
-            # Check flags
-            flags = []
-            if getattr(user, 'is_scam', False):
-                flags.append("Scam")
-            if getattr(user, 'is_fake', False):
-                flags.append("Fake")
-            flags_str = ", ".join(flags) if flags else "Clean"
-
-            # Build full name
-            full_name_parts = []
-            if user.first_name:
-                full_name_parts.append(user.first_name)
-            if user.last_name:
-                full_name_parts.append(user.last_name)
-            full_name = " ".join(full_name_parts) if full_name_parts else "Unknown"
-
-            return jsonify({
-                "success": True,
-                "type": "bot" if user.is_bot else "user",
-                "full_name": full_name,
-                "id": user.id,
-                "username": f"@{user.username}" if user.username else "None",
-                "context_id": user.id,
-                "data_center": f"{user.dc_id} ({dc_location})" if user.dc_id else "Unknown",
-                "premium": premium_status,
-                "verified": verified_status,
-                "flags": flags_str,
-                "status": status,
-                "account_created_on": account_created_str,
-                "account_age": account_age
-            })
-
-        except (PeerIdInvalid, UsernameNotOccupied):
-            logger.info(f"Username '{username}' not found as user/bot. Checking for chat...")
-            
-            # Try to get as chat (group/channel)
-            try:
-                chat = await client.get_chat(username)
-                logger.info(f"Chat found: {username}")
-                
-                dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
-                
-                # Map chat type
-                chat_type_map = {
-                    ChatType.SUPERGROUP: "Supergroup",
-                    ChatType.GROUP: "Group",
-                    ChatType.CHANNEL: "Channel"
-                }
-                chat_type = chat_type_map.get(chat.type, "Unknown")
-
-                return jsonify({
-                    "success": True,
-                    "type": chat_type.lower(),
-                    "title": chat.title or "Unknown",
-                    "id": chat.id,
-                    "type_description": chat_type,
-                    "member_count": chat.members_count if hasattr(chat, 'members_count') and chat.members_count else "Unknown",
-                    "data_center": f"{chat.dc_id} ({dc_location})" if chat.dc_id else "Unknown",
-                    "username": f"@{chat.username}" if hasattr(chat, 'username') and chat.username else "None",
-                    "description": chat.description if hasattr(chat, 'description') and chat.description else "None"
-                })
-
-            except UsernameNotOccupied:
-                logger.error(f"Username '{username}' does not exist")
-                return jsonify({
-                    "success": False,
-                    "error": f"Username '@{username}' does not exist"
-                }), 404
-                
-            except (ChannelInvalid, PeerIdInvalid):
-                error_message = "Bot lacks permission to access this channel or group"
-                logger.error(f"Permission error for '{username}': {error_message}")
-                return jsonify({
-                    "success": False,
-                    "error": error_message
-                }), 403
-                
-            except Exception as chat_error:
-                logger.error(f"Error fetching chat info for '{username}': {str(chat_error)}")
-                return jsonify({
-                    "success": False,
-                    "error": f"Failed to fetch chat info: {str(chat_error)}"
-                }), 500
-
-        except Exception as user_error:
-            logger.error(f"Error fetching user info for '{username}': {str(user_error)}")
-            return jsonify({
-                "success": False,
-                "error": f"Failed to fetch user info: {str(user_error)}"
-            }), 500
-
     except Exception as e:
         logger.error(f"Unhandled exception for '{username}': {str(e)}")
         return jsonify({
@@ -296,14 +292,13 @@ async def get_info(request_args):
         }), 500
 
 @app.route('/health')
-@async_route
-async def health_check(request_args):
+def health_check():
     """Health check endpoint"""
     try:
-        client = await get_bot_client()
+        global bot
         return jsonify({
             "status": "healthy",
-            "bot_connected": client.is_connected if client else False,
+            "bot_connected": bot.is_connected if bot else False,
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -329,18 +324,27 @@ def internal_error(error):
         "error": "Internal server error"
     }), 500
 
-# Initialize bot on startup
-def init_bot():
-    """Initialize bot in a separate thread"""
+# Initialize event loop and bot on startup
+def initialize():
+    """Initialize the event loop and bot"""
+    global loop_thread
+    
+    # Start event loop in a separate thread
+    loop_thread = threading.Thread(target=start_event_loop, daemon=True)
+    loop_thread.start()
+    
+    # Wait for loop to be ready
+    time.sleep(1)
+    
+    # Initialize bot
     try:
-        run_async_in_thread(get_bot_client())
+        run_async(init_bot())
         logger.info("Bot initialization completed")
     except Exception as e:
         logger.error(f"Failed to initialize bot: {e}")
 
-# Start bot initialization in background
-init_thread = threading.Thread(target=init_bot, daemon=True)
-init_thread.start()
+# Initialize everything
+initialize()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
