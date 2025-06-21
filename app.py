@@ -40,7 +40,10 @@ def async_route(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         try:
-            coro = f(*args, **kwargs)
+            # Extract request data in the main thread
+            request_args = request.args.to_dict() if request.args else {}
+            # Call the async function with extracted data
+            coro = f(request_args, *args, **kwargs)
             return run_async_in_thread(coro)
         except Exception as e:
             logger.error(f"Error in async route: {str(e)}")
@@ -162,9 +165,9 @@ def welcome():
 
 @app.route('/info')
 @async_route
-async def get_info():
+async def get_info(request_args):
     """Main endpoint to get Telegram entity information"""
-    username = request.args.get('username')
+    username = request_args.get('username')
     if not username:
         return jsonify({"error": "Username parameter is required"}), 400
 
@@ -294,7 +297,7 @@ async def get_info():
 
 @app.route('/health')
 @async_route
-async def health_check():
+async def health_check(request_args):
     """Health check endpoint"""
     try:
         client = await get_bot_client()
