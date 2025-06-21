@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from quart import Quart, request, jsonify
 from pyrogram import Client
 from pyrogram.errors import PeerIdInvalid, UsernameNotOccupied, ChannelInvalid
 from pyrogram.enums import ChatType
@@ -8,9 +8,8 @@ from config import API_ID, API_HASH, BOT_TOKEN
 import logging
 import os
 import asyncio
-from functools import wraps
 
-app = Flask(__name__)
+app = Quart(__name__)
 
 # Configure logging
 logging.basicConfig(
@@ -29,9 +28,6 @@ bot = Client(
     workdir="/tmp"
 )
 
-# Global event loop for Pyrogram
-loop = asyncio.get_event_loop()
-
 # Start bot asynchronously
 async def start_bot():
     try:
@@ -41,19 +37,13 @@ async def start_bot():
         logger.error(f"Failed to start Pyrogram bot: {str(e)}")
         raise
 
-# Initialize bot before Flask starts
+# Initialize bot before app starts
+loop = asyncio.get_event_loop()
 try:
     loop.run_until_complete(start_bot())
 except Exception as e:
     logger.error(f"Bot initialization failed: {str(e)}")
     exit(1)
-
-# Decorator to run async functions in Flask routes
-def async_action(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        return asyncio.run_coroutine_threadsafe(f(*args, **kwargs), loop).result()
-    return decorated
 
 def get_dc_locations():
     return {
@@ -113,7 +103,7 @@ def map_user_status(status):
     return "Unknown"
 
 @app.route('/')
-def welcome():
+async def welcome():
     return jsonify({
         "message": "Welcome to the SmartDevs Info API!",
         "usage": {
@@ -132,7 +122,6 @@ def welcome():
     })
 
 @app.route('/info')
-@async_action
 async def get_info():
     username = request.args.get('username')
     if not username:
@@ -145,7 +134,8 @@ async def get_info():
         DC_LOCATIONS = get_dc_locations()
 
         try:
-            user = await bot.get_users(username)
+            # Add timeout for Pyrogram calls
+            user = await asyncio.wait_for(bot.get_users(username), timeout=10.0)
             logger.info(f"User/bot found: {username}")
             premium_status = "Yes" if user.is_premium else "No"
             dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
@@ -174,7 +164,7 @@ async def get_info():
         except (PeerIdInvalid, UsernameNotOccupied):
             logger.info(f"Username '{username}' not found as user/bot. Checking for chat...")
             try:
-                chat = await bot.get_chat(username)
+                chat = await asyncio.wait_for(bot.get_chat(username), timeout=10.0)
                 dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
                 chat_type = {
                     ChatType.SUPERGROUP: "Supergroup",
@@ -195,13 +185,18 @@ async def get_info():
                 logger.error(f"Username '{username}' does not exist")
                 return jsonify({"error": f"Username '@{username}' does not exist"}), 404
             except (ChannelInvalid, PeerIdInvalid):
-                error_message = "Bot lacks permission to access this channel or group"
                 logger.error(f"Permission error for '{username}'")
-                return jsonify({"error": error_message}), 403
+                return jsonify({"error": "Bot lacks permission to access this channel or group"}), 403
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout fetching chat info for '{username}'")
+                return jsonify({"error": "Request to Telegram API timed out"}), 504
             except Exception as e:
                 logger.error(f"Error fetching chat info for '{username}': {str(e)}")
                 return jsonify({"error": f"Failed to fetch info: {str(e)}"}), 500
 
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching user info for '{username}'")
+            return jsonify({"error": "Request to Telegram API timed out"}), 504
         except Exception as e:
             logger.error(f"Error fetching user info for '{username}': {str(e)}")
             return jsonify({"error": f"Failed to fetch info: {str(e)}"}), 500
@@ -212,10 +207,5 @@ async def get_info():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # Default to 10000 for Render
-    logger.info(f"Starting Flask app on host 0.0.0.0, port {port}")
-    # Use hypercorn for async support
-    from hypercorn.config import Config
-    from hypercorn.asyncio import serve
-    config = Config()
-    config.bind = [f"0.0.0.0:{port}"]
-    loop.run_until_complete(serve(app, config))
+    logger.info(f"Starting Quart app on host 0.0.0.0, port {port}")
+    app.run(host="0.0.0.0", port=port, loop=loop)
