@@ -1,6 +1,5 @@
-fastapi==0.115.0
+flask
 pyrofork==2.3.66
 tgcrypto
 python-dateutil==2.9.0
-uvicorn==0.30.6
 gunicorn==23.0.0
