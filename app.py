@@ -1,14 +1,14 @@
-# Flask API with Pyrogram Client for Telegram Information
+# FastAPI + Pyrogram Telegram Info API
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from pyrogram import Client
 from pyrogram.enums import ParseMode, ChatType, UserStatus
 from pyrogram.errors import PeerIdInvalid, UsernameNotOccupied, ChannelInvalid
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 import asyncio
 import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,13 +19,8 @@ API_ID = 28239710
 API_HASH = "7fc5b35692454973318b86481ab5eca3"
 BOT_TOKEN = "7941865929:AAEf7o5f-_VQKKWQKLs0qMOFHYwTi8Pjgwg"
 
-# Flask app
-app = Flask(__name__)
-
-# Global variables for client and event loop
+# Global client variable
 client = None
-client_loop = None
-client_thread = None
 
 def get_dc_locations():
     """Returns a dictionary mapping Data Center IDs to their locations"""
@@ -59,10 +54,10 @@ def calculate_account_age(creation_date):
 def estimate_account_creation_date(user_id):
     """Estimate account creation date based on user ID"""
     reference_points = [
-        (100000000, datetime(2013, 8, 1)),  # Telegram's launch date
-        (1273841502, datetime(2020, 8, 13)),  # Example reference point
-        (1500000000, datetime(2021, 5, 1)),  # Another reference point
-        (2000000000, datetime(2022, 12, 1)),  # Another reference point
+        (100000000, datetime(2013, 8, 1)),
+        (1273841502, datetime(2020, 8, 13)),
+        (1500000000, datetime(2021, 5, 1)),
+        (2000000000, datetime(2022, 12, 1)),
     ]
     
     closest_point = min(reference_points, key=lambda x: abs(x[0] - user_id))
@@ -79,18 +74,14 @@ def format_user_status(status):
     if not status:
         return "Unknown"
     
-    if status == UserStatus.ONLINE:
-        return "Online"
-    elif status == UserStatus.OFFLINE:
-        return "Offline"
-    elif status == UserStatus.RECENTLY:
-        return "Recently online"
-    elif status == UserStatus.LAST_WEEK:
-        return "Last seen within week"
-    elif status == UserStatus.LAST_MONTH:
-        return "Last seen within month"
-    else:
-        return "Unknown"
+    status_map = {
+        UserStatus.ONLINE: "Online",
+        UserStatus.OFFLINE: "Offline",
+        UserStatus.RECENTLY: "Recently online",
+        UserStatus.LAST_WEEK: "Last seen within week",
+        UserStatus.LAST_MONTH: "Last seen within month"
+    }
+    return status_map.get(status, "Unknown")
 
 async def get_user_info(username):
     """Get user or bot information"""
@@ -98,7 +89,7 @@ async def get_user_info(username):
         DC_LOCATIONS = get_dc_locations()
         user = await client.get_users(username)
         
-        premium_status = user.is_premium if hasattr(user, 'is_premium') else False
+        premium_status = getattr(user, 'is_premium', False)
         dc_location = DC_LOCATIONS.get(user.dc_id, "Unknown")
         account_created = estimate_account_creation_date(user.id)
         account_created_str = account_created.strftime("%B %d, %Y")
@@ -142,7 +133,7 @@ async def get_user_info(username):
         return {"success": False, "error": "User not found"}
     except Exception as e:
         LOGGER.error(f"Error fetching user info: {str(e)}")
-        return {"success": False, "error": "Failed to fetch user information"}
+        return {"success": False, "error": f"Failed to fetch user information: {str(e)}"}
 
 async def get_chat_info(username):
     """Get chat (group/channel) information"""
@@ -150,15 +141,26 @@ async def get_chat_info(username):
         DC_LOCATIONS = get_dc_locations()
         chat = await client.get_chat(username)
         
-        chat_type = "unknown"
-        if chat.type == ChatType.SUPERGROUP:
-            chat_type = "supergroup"
-        elif chat.type == ChatType.GROUP:
-            chat_type = "group"
-        elif chat.type == ChatType.CHANNEL:
-            chat_type = "channel"
+        chat_type_map = {
+            ChatType.SUPERGROUP: "supergroup",
+            ChatType.GROUP: "group",
+            ChatType.CHANNEL: "channel"
+        }
+        chat_type = chat_type_map.get(chat.type, "unknown")
         
-        dc_location = DC_LOCATIONS.get(chat.dc_id, "Unknown")
+        dc_location = DC_LOCATIONS.get(getattr(chat, 'dc_id', None), "Unknown")
+        
+        # Generate appropriate links
+        if chat.username:
+            join_link = f"t.me/{chat.username}"
+            permanent_link = f"t.me/{chat.username}"
+        elif chat.id < 0:
+            chat_id_str = str(chat.id).replace('-100', '')
+            join_link = f"t.me/c/{chat_id_str}/1"
+            permanent_link = f"t.me/c/{chat_id_str}/1"
+        else:
+            join_link = f"tg://resolve?domain={chat.id}"
+            permanent_link = f"tg://resolve?domain={chat.id}"
         
         chat_data = {
             "success": True,
@@ -166,13 +168,13 @@ async def get_chat_info(username):
             "id": chat.id,
             "title": chat.title,
             "username": chat.username,
-            "dc_id": chat.dc_id,
+            "dc_id": getattr(chat, 'dc_id', None),
             "dc_location": dc_location,
-            "members_count": chat.members_count,
+            "members_count": getattr(chat, 'members_count', None),
             "description": getattr(chat, 'description', None),
             "links": {
-                "join": f"t.me/c/{str(chat.id).replace('-100', '')}/100" if chat.id < 0 else f"t.me/{chat.username}",
-                "permanent": f"t.me/c/{str(chat.id).replace('-100', '')}/100" if chat.id < 0 else f"t.me/{chat.username}"
+                "join": join_link,
+                "permanent": permanent_link
             }
         }
         
@@ -182,7 +184,7 @@ async def get_chat_info(username):
         return {"success": False, "error": "Chat not found or access denied"}
     except Exception as e:
         LOGGER.error(f"Error fetching chat info: {str(e)}")
-        return {"success": False, "error": "Failed to fetch chat information"}
+        return {"success": False, "error": f"Failed to fetch chat information: {str(e)}"}
 
 async def get_telegram_info(username):
     """Get information for any Telegram entity (user, bot, group, channel)"""
@@ -204,76 +206,12 @@ async def get_telegram_info(username):
     # If both failed
     return {"success": False, "error": "Entity not found or access denied"}
 
-def run_async_in_client_loop(coro):
-    """Run async function in the client's event loop"""
-    future = asyncio.run_coroutine_threadsafe(coro, client_loop)
-    return future.result(timeout=30)  # 30 second timeout
-
-@app.route('/info', methods=['GET'])
-def info_endpoint():
-    """API endpoint to get Telegram entity information"""
-    username = request.args.get('username')
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage the lifespan of the FastAPI app"""
+    global client
     
-    if not username:
-        return jsonify({
-            "success": False,
-            "error": "Username parameter is required"
-        }), 400
-    
-    try:
-        # Run the async function in the client's event loop
-        result = run_async_in_client_loop(get_telegram_info(username))
-        
-        if result["success"]:
-            return jsonify(result)
-        else:
-            return jsonify(result), 404
-            
-    except Exception as e:
-        LOGGER.error(f"API error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": "Internal server error"
-        }), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        "success": True,
-        "status": "API is running",
-        "bot_status": "connected" if client and client.is_connected else "disconnected"
-    })
-
-@app.route('/', methods=['GET'])
-def root():
-    """Root endpoint with API documentation"""
-    return jsonify({
-        "success": True,
-        "message": "Telegram Info API",
-        "endpoints": {
-            "/info": "GET - Get telegram entity info (requires 'username' parameter)",
-            "/health": "GET - Health check",
-            "/": "GET - This documentation"
-        },
-        "usage": {
-            "example": "/info?username=telegram",
-            "supported": [
-                "Usernames (@username or username)",
-                "User IDs",
-                "Channel usernames",
-                "Group usernames",
-                "Bot usernames",
-                "Telegram links (t.me/username)"
-            ]
-        }
-    })
-
-async def run_client():
-    """Run the Pyrogram client"""
-    global client, client_loop
-    client_loop = asyncio.get_event_loop()
-    
+    # Startup
     LOGGER.info("Creating Bot Client From BOT_TOKEN")
     client = Client(
         "GetUserInfo",
@@ -286,38 +224,80 @@ async def run_client():
     await client.start()
     LOGGER.info("Pyrogram client started successfully!")
     
-    # Keep the client running
-    try:
-        await client.idle()
-    except KeyboardInterrupt:
-        LOGGER.info("Received interrupt signal")
-    finally:
+    yield
+    
+    # Shutdown
+    if client:
         await client.stop()
         LOGGER.info("Pyrogram client stopped!")
 
-def start_client():
-    """Start the client in a separate thread"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_client())
+# Create FastAPI app with lifespan
+app = FastAPI(
+    title="Telegram Info API",
+    description="Get information about Telegram users, bots, channels, and groups",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
-if __name__ == '__main__':
-    # Start the Pyrogram client in a separate thread
-    client_thread = threading.Thread(target=start_client, daemon=True)
-    client_thread.start()
-    
-    # Wait a bit for client to initialize
-    import time
-    time.sleep(5)
-    
+@app.get("/info")
+async def info_endpoint(username: str = Query(..., description="Username, user ID, or Telegram link")):
+    """API endpoint to get Telegram entity information"""
     try:
-        # Run Flask app
-        LOGGER.info("Starting Flask API server...")
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
-    except KeyboardInterrupt:
-        LOGGER.info("Shutting down...")
-    finally:
-        if client:
-            # Send stop signal to client
-            if client_loop and not client_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(client.stop(), client_loop)
+        result = await get_telegram_info(username)
+        
+        if result["success"]:
+            return result
+        else:
+            raise HTTPException(status_code=404, detail=result["error"])
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"API error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "success": True,
+        "status": "API is running",
+        "bot_status": "connected" if client and client.is_connected else "disconnected"
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API documentation"""
+    return {
+        "success": True,
+        "message": "Telegram Info API",
+        "endpoints": {
+            "/info": "GET - Get telegram entity info (requires 'username' parameter)",
+            "/health": "GET - Health check",
+            "/": "GET - This documentation",
+            "/docs": "GET - Interactive API documentation",
+            "/redoc": "GET - Alternative API documentation"
+        },
+        "usage": {
+            "example": "/info?username=telegram",
+            "supported": [
+                "Usernames (@username or username)",
+                "User IDs",
+                "Channel usernames",
+                "Group usernames",
+                "Bot usernames",
+                "Telegram links (t.me/username)"
+            ]
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    LOGGER.info("Starting FastAPI server with Uvicorn...")
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=5000,
+        log_level="info",
+        reload=False
+    )
