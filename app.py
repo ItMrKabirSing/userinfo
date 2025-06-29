@@ -7,6 +7,8 @@ from pyrogram.errors import PeerIdInvalid, UsernameNotOccupied, ChannelInvalid
 from flask import Flask, request, jsonify
 import asyncio
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,15 +22,10 @@ BOT_TOKEN = "7941865929:AAEf7o5f-_VQKKWQKLs0qMOFHYwTi8Pjgwg"
 # Flask app
 app = Flask(__name__)
 
-# Pyrogram client
-LOGGER.info("Creating Bot Client From BOT_TOKEN")
-client = Client(
-    "GetUserInfo",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
-LOGGER.info("Bot Client Created Successfully!")
+# Global variables for client and event loop
+client = None
+client_loop = None
+client_thread = None
 
 def get_dc_locations():
     """Returns a dictionary mapping Data Center IDs to their locations"""
@@ -207,6 +204,11 @@ async def get_telegram_info(username):
     # If both failed
     return {"success": False, "error": "Entity not found or access denied"}
 
+def run_async_in_client_loop(coro):
+    """Run async function in the client's event loop"""
+    future = asyncio.run_coroutine_threadsafe(coro, client_loop)
+    return future.result(timeout=30)  # 30 second timeout
+
 @app.route('/info', methods=['GET'])
 def info_endpoint():
     """API endpoint to get Telegram entity information"""
@@ -219,11 +221,8 @@ def info_endpoint():
         }), 400
     
     try:
-        # Run the async function
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(get_telegram_info(username))
-        loop.close()
+        # Run the async function in the client's event loop
+        result = run_async_in_client_loop(get_telegram_info(username))
         
         if result["success"]:
             return jsonify(result)
@@ -243,7 +242,7 @@ def health_check():
     return jsonify({
         "success": True,
         "status": "API is running",
-        "bot_status": "connected" if client.is_connected else "disconnected"
+        "bot_status": "connected" if client and client.is_connected else "disconnected"
     })
 
 @app.route('/', methods=['GET'])
@@ -270,27 +269,55 @@ def root():
         }
     })
 
-async def start_client():
-    """Start the Pyrogram client"""
+async def run_client():
+    """Run the Pyrogram client"""
+    global client, client_loop
+    client_loop = asyncio.get_event_loop()
+    
+    LOGGER.info("Creating Bot Client From BOT_TOKEN")
+    client = Client(
+        "GetUserInfo",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
+    LOGGER.info("Bot Client Created Successfully!")
+    
     await client.start()
     LOGGER.info("Pyrogram client started successfully!")
+    
+    # Keep the client running
+    try:
+        await client.idle()
+    except KeyboardInterrupt:
+        LOGGER.info("Received interrupt signal")
+    finally:
+        await client.stop()
+        LOGGER.info("Pyrogram client stopped!")
 
-async def stop_client():
-    """Stop the Pyrogram client"""
-    await client.stop()
-    LOGGER.info("Pyrogram client stopped!")
-
-if __name__ == '__main__':
-    # Start the Pyrogram client
+def start_client():
+    """Start the client in a separate thread"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(start_client())
+    loop.run_until_complete(run_client())
+
+if __name__ == '__main__':
+    # Start the Pyrogram client in a separate thread
+    client_thread = threading.Thread(target=start_client, daemon=True)
+    client_thread.start()
+    
+    # Wait a bit for client to initialize
+    import time
+    time.sleep(5)
     
     try:
         # Run Flask app
         LOGGER.info("Starting Flask API server...")
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        LOGGER.info("Shutting down...")
     finally:
-        # Stop the client when Flask app stops
-        loop.run_until_complete(stop_client())
-        loop.close()
+        if client:
+            # Send stop signal to client
+            if client_loop and not client_loop.is_closed():
+                asyncio.run_coroutine_threadsafe(client.stop(), client_loop)
