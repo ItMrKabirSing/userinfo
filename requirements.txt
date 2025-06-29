@@ -2,4 +2,3 @@ flask
 pyrofork
 tgcrypto
 python-dateutil
-gunicorn
